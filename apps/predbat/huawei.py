@@ -1,6 +1,6 @@
 """Huawei LUNA2000 helper for Predbat.
 
-LIVE TOU TEST VERSION V6.2 - WRITES NATIVE TOU ONLY; EXPLICIT FALSE HANDOFF.
+LIVE TOU TEST VERSION V6.3 - FUTURE-ONLY NATIVE TOU; EXPLICIT FALSE HANDOFF.
 
 This laboratory version writes ONLY the Huawei TOU table and the three settings
 needed to activate that table. It deliberately does NOT execute true-export
@@ -51,7 +51,7 @@ from utils import calc_percent_limit
 class HuaweiHelper:
     """Huawei LUNA2000 TOU live-test writer and diagnostics."""
 
-    BUILD = "v6.2-false-handoff"
+    BUILD = "v6.3-future-only"
 
     TOU_SENSOR = "sensor.batteries_tou_charging_and_discharging_periods"
     WORKING_MODE_ENTITY = "select.batteries_working_mode"
@@ -805,9 +805,14 @@ class HuaweiHelper:
                     }
                 )
 
-        # Huawei only cares about the +/- command. Merge adjacent equal flags
-        # even if Predbat supplied different SOC target metadata per window.
-        periods = self._merge_adjacent_tou_periods(periods)
+        # The rolling 24h clock preview above is useful diagnostically, but the
+        # live Huawei table must not waste slots on clock periods that already
+        # elapsed today. Rebuild the writable table directly from the absolute
+        # timeline, retaining only the current slot and the remainder of today.
+        # Midnight is always a hard split; tomorrow is written after midnight.
+        periods = self._build_future_current_day_tou_periods(
+            absolute_intervals, horizon_start
+        )
 
         # Adjacent true-export quarters are one continuous timed override.
         # Merge them so e.g. 08:00-08:15 + 08:15-08:30 + 08:30-09:30
@@ -836,6 +841,71 @@ class HuaweiHelper:
             "actions": actions,
             "conflicts": list(self._last_tou_conflicts),
         }
+
+    def _build_future_current_day_tou_periods(self, absolute_intervals, horizon_start):
+        """Build only the TOU periods that are still relevant today.
+
+        Huawei TOU periods are recurring clock entries. Keeping periods whose
+        end time has already passed wastes one of the 14 hardware slots and can
+        make a busy Predbat plan fail validation. For the live table we therefore
+        keep only the current control slot and future intervals up to 24:00.
+
+        Midnight is a hard boundary: nothing is carried through 24:00 in one
+        period. The next Predbat run after midnight writes a new 00:00-based
+        table for the new day. Until then, the omitted early-day clock range is
+        simply a TOU gap (fail-safe idle rather than a stale command).
+        """
+        now_abs = int(horizon_start)
+        day_base = (now_abs // 1440) * 1440
+        day_end = day_base + 1440
+
+        # Retain the currently active 15-minute control quantum rather than
+        # starting a rewritten TOU period at an arbitrary minute such as 18:25.
+        slot_start_abs = day_base + ((now_abs - day_base) // self.CONTROL_SLOT_MINUTES) * self.CONTROL_SLOT_MINUTES
+
+        periods = []
+        for interval in absolute_intervals:
+            interval_start = int(interval["absolute_start"])
+            interval_end = int(interval["absolute_end"])
+
+            # Fully expired, or entirely on the next day.
+            if interval_end <= now_abs or interval_start >= day_end:
+                continue
+
+            state = interval["state"]
+            kind = state.get("kind")
+            if kind not in ("charge", "discharge"):
+                # Hold/export remain real TOU gaps.
+                continue
+
+            start_abs = max(interval_start, slot_start_abs)
+            end_abs = min(interval_end, day_end)
+            if start_abs >= end_abs:
+                continue
+
+            start_minute = start_abs - day_base
+            end_minute = end_abs - day_base
+
+            # A segment that reaches midnight ends at Huawei's valid 24:00.
+            # It is never merged with a 00:00 segment from the next day.
+            item = {
+                "start_minute": start_minute,
+                "end_minute": end_minute,
+                "start": self._minute_to_hhmm(start_minute),
+                "end": self._minute_to_hhmm(end_minute),
+                "days": self.TOU_DAYS,
+                "kind": kind,
+                "flag": "+" if kind == "charge" else "-",
+                "target_kwh": state.get("target_kwh"),
+                "target_percent": state.get("target_percent"),
+                "reason": state.get("reason"),
+                "car": state.get("car"),
+                "source_start": state.get("source_start"),
+                "source_end": state.get("source_end"),
+            }
+            periods.append(item)
+
+        return self._merge_adjacent_tou_periods(periods)
 
     def get_export_power_w(self):
         """Return Predbat's configured maximum discharge power in watts.
@@ -1424,13 +1494,13 @@ class HuaweiHelper:
 
         self.log("Huawei TOU PREVIEW: ========================================")
         self.log(
-            "Huawei TOU PREVIEW: Rolling horizon {} -> {} (24 hours)".format(
+            "Huawei TOU PREVIEW: Rolling source horizon {} -> {} (24 hours)".format(
                 self._absolute_label(preview["horizon_start"]),
                 self._absolute_label(preview["horizon_end"]),
             )
         )
         self.log(
-            "Huawei TOU PREVIEW: Predbat would create {} period(s)".format(
+            "Huawei TOU PREVIEW: Writable future-of-today table has {} period(s)".format(
                 len(periods)
             )
         )
@@ -1593,7 +1663,7 @@ class HuaweiHelper:
     def log_predbat_plan_preview(self):
         """Main entry point called from execute.py.
 
-        V6 writes the sparse TOU table and activates native Huawei TOU only
+        V6.3 writes only the still-relevant part of today's sparse TOU table and activates native Huawei TOU only
         after exact sensor readback. Timed true-export commands remain preview-only.
         """
         enabled = self.huawei_tou_enabled()
@@ -1662,7 +1732,7 @@ class HuaweiHelper:
         self._last_preview_signature = signature
 
         self.log("Huawei PLAN TEST: ===========================================")
-        self.log("Huawei PLAN TEST: V6 LIVE TOU TEST - sparse 15m TOU +/- WRITES ENABLED; true export remains preview-only")
+        self.log("Huawei PLAN TEST: V6.3 LIVE TOU TEST - future-only sparse 15m TOU +/- WRITES ENABLED; midnight is a hard split; true export remains preview-only")
         self.log_huawei_state_preview(huawei_state)
         self.log_tou_preview(preview)
         self.log_action_preview(preview)
