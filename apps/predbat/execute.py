@@ -58,6 +58,10 @@ class Execute:
             if inverter.id not in self.count_inverter_writes:
                 self.count_inverter_writes[inverter.id] = 0
 
+            # Experimental Huawei plan preview - READ ONLY
+            if inverter.huawei:
+                inverter.huawei.log_predbat_plan_preview()
+
             # Read-only mode
             if self.set_read_only:
                 if self.set_read_only_axle:
